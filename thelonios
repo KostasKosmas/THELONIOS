@@ -1,0 +1,137 @@
+from fastapi import FastAPI
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+import uvicorn
+import json
+import os
+import ta
+import pattern_recognition as pr
+import firebase_admin
+from firebase_admin import messaging, credentials, firestore
+
+# Δημιουργία FastAPI εφαρμογής
+app = FastAPI()
+
+# Φόρτωση εκπαιδευμένου μοντέλου
+MODEL_PATH = "crypto_trading_model.keras"
+if os.path.exists(MODEL_PATH):
+    model = tf.keras.models.load_model(MODEL_PATH)
+    print("✅ Μοντέλο φορτώθηκε επιτυχώς!")
+else:
+    model = None
+
+# Ρύθμιση Firebase Firestore και Cloud Messaging
+cred = credentials.Certificate("firebase_credentials.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# Συνάρτηση για αποθήκευση trade signals στο Firestore
+def save_trade_to_firestore(symbol, trade_signal, confidence, predicted_price, last_price):
+    trade_data = {
+        "symbol": symbol,
+        "trade_signal": trade_signal,
+        "confidence": confidence,
+        "predicted_price": predicted_price,
+        "last_price": last_price,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    }
+    db.collection("trade_signals").add(trade_data)
+    print("✅ Trade saved to Firestore")
+
+# Συνάρτηση για λήψη ιστορικών δεδομένων
+@app.get("/get_data/{symbol}")
+def get_historical_data(symbol: str, interval: str = '1m', period: str = '7d'):
+    df = yf.download(tickers=symbol, interval=interval, period=period)
+    if df.empty:
+        return {"error": "Δεν βρέθηκαν δεδομένα"}
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+    df.columns = ['open', 'high', 'low', 'close', 'volume']
+    return df.to_json()
+
+# Προσθήκη τεχνικών δεικτών και στρατηγικών trading
+def add_indicators(df):
+    df['EMA_50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
+    df['EMA_200'] = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator()
+    df['Bollinger_High'] = ta.volatility.BollingerBands(df['close']).bollinger_hband()
+    df['Bollinger_Low'] = ta.volatility.BollingerBands(df['close']).bollinger_lband()
+    df['Stoch_RSI'] = ta.momentum.StochRSIIndicator(df['close']).stochrsi()
+    
+    # Fibonacci Retracement Levels
+    high_price = df['high'].max()
+    low_price = df['low'].min()
+    df['Fib_23.6'] = high_price - (0.236 * (high_price - low_price))
+    df['Fib_38.2'] = high_price - (0.382 * (high_price - low_price))
+    df['Fib_50'] = high_price - (0.5 * (high_price - low_price))
+    df['Fib_61.8'] = high_price - (0.618 * (high_price - low_price))
+    
+    # Trend Analysis (Simple Momentum)
+    df['Trend'] = df['close'].diff().apply(lambda x: 'Uptrend' if x > 0 else 'Downtrend')
+    
+    # Arbitrage Opportunity (Difference between EMA50 and EMA200)
+    df['Arbitrage_Signal'] = df['EMA_50'] - df['EMA_200']
+    
+    # Chart Patterns Recognition
+    df['Pattern'] = pr.detect_chart_patterns(df)
+    
+    return df.dropna()
+
+# Αποστολή ειδοποίησης μέσω Firebase
+def send_notification(symbol, signal, confidence):
+    message = messaging.Message(
+        notification=messaging.Notification(
+            title=f"🚀 {symbol} Trading Alert!",
+            body=f"{signal} Signal with {confidence}% confidence"
+        ),
+        topic="trading_alerts"
+    )
+    messaging.send(message)
+    print("📢 Notification Sent!")
+
+# Συνάρτηση για προβλέψεις τιμής
+@app.get("/predict/{symbol}")
+def predict(symbol: str):
+    global model
+    if model is None:
+        return {"error": "Το μοντέλο δεν είναι διαθέσιμο"}
+    
+    df = yf.download(tickers=symbol, interval='1m', period='7d')
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+    df = add_indicators(df)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(df[['close']])
+    
+    last_120 = scaled_data[-120:].reshape(1, 120, 1)
+    prediction = model.predict(last_120)
+    predicted_price = scaler.inverse_transform(prediction)[0][0]
+    confidence = abs((predicted_price - df['close'].iloc[-1]) / df['close'].iloc[-1]) * 100
+    
+    if confidence < 10:
+        return {"message": "Confidence too low for reliable trade", "confidence": f"{confidence:.2f}%"}
+    
+    trade_signal = "BUY" if predicted_price > df['close'].iloc[-1] else "SELL"
+    send_notification(symbol, trade_signal, confidence)
+    save_trade_to_firestore(symbol, trade_signal, confidence, predicted_price, df['close'].iloc[-1])
+    
+    return {
+        "symbol": symbol,
+        "last_price": df['close'].iloc[-1],
+        "predicted_price": predicted_price,
+        "confidence": f"{confidence:.2f}%",
+        "trade_signal": trade_signal,
+        "Fibonacci Levels": {
+            "23.6%": df['Fib_23.6'].iloc[-1],
+            "38.2%": df['Fib_38.2'].iloc[-1],
+            "50%": df['Fib_50'].iloc[-1],
+            "61.8%": df['Fib_61.8'].iloc[-1]
+        },
+        "Trend": df['Trend'].iloc[-1],
+        "Arbitrage_Signal": df['Arbitrage_Signal'].iloc[-1],
+        "Pattern": df['Pattern'].iloc[-1]
+    }
+
+# Εκκίνηση API στο Firebase Cloud Functions
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
